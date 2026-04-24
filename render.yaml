@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: science-conf-server
+    runtime: node
+    region: frankfurt
+    rootDir: apps/server
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: NODE_ENV
+        value: production
