@@ -1,5 +1,14 @@
 import { Server, Socket } from 'socket.io'
-import { GALAXIES } from './galaxies.js'
+import { GALAXIES_WITH_IMAGES as GALAXIES } from './galaxies-data.ts'
+
+const PAIR_COLORS = [
+  '#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7',
+  '#DDA0DD', '#98D8C8', '#F7DC6F', '#BB8FCE', '#85C1E9',
+  '#F8C471', '#82E0AA', '#F1948A', '#AED6F1', '#D7BDE2',
+  '#A3E4D7', '#FAD7A0', '#A9CCE3', '#D5F5E3', '#FADBD8',
+  '#E8DAEF', '#D4EFDF', '#FCF3CF', '#D6EAF8', '#F2D7D5',
+  '#EBDEF0', '#D1F2EB', '#FEF9E7', '#D4E6F1', '#F5EEF8',
+]
 
 type Participant = {
   id: string
@@ -7,6 +16,8 @@ type Participant = {
   seatId: string | null
   galaxyId: string
   pairId: string | null
+  pairColor: string | null
+  joinOrder: number
   hiddenState: Record<string, unknown>
   connectedAt: Date
 }
@@ -30,6 +41,8 @@ export function createSession(io: Server) {
   let currentScene: ActiveScene | null = null
   let pollVotes: PollVotes = new Map()
   let galaxyIndex = 0
+  let joinCounter = 0
+  let colorIndex = 0
 
   function assignGalaxy(): string {
     const galaxy = GALAXIES[galaxyIndex % GALAXIES.length]
@@ -37,14 +50,44 @@ export function createSession(io: Server) {
     return galaxy.id
   }
 
+  function getNextColor(): string {
+    const color = PAIR_COLORS[colorIndex % PAIR_COLORS.length]
+    colorIndex++
+    return color
+  }
+
   function assignPairs() {
     const ids = Array.from(participants.keys())
     for (let i = 0; i < ids.length - 1; i += 2) {
       const p1 = participants.get(ids[i])!
       const p2 = participants.get(ids[i + 1])!
+      if (p1.pairId && p2.pairId) continue
+      const color = getNextColor()
       p1.pairId = ids[i + 1]
       p2.pairId = ids[i]
+      p1.pairColor = color
+      p2.pairColor = color
     }
+  }
+
+  function findUnpairedParticipant(excludeId: string): Participant | undefined {
+    for (const p of participants.values()) {
+      if (p.id !== excludeId && !p.pairId) return p
+    }
+    return undefined
+  }
+
+  function pairTwo(p1: Participant, p2: Participant) {
+    const color = getNextColor()
+    p1.pairId = p2.id
+    p2.pairId = p1.id
+    p1.pairColor = color
+    p2.pairColor = color
+
+    const s1 = io.sockets.sockets.get(p1.socketId)
+    const s2 = io.sockets.sockets.get(p2.socketId)
+    s1?.emit('entanglement:paired', { pairColor: color })
+    s2?.emit('entanglement:paired', { pairColor: color })
   }
 
   function broadcastPollResults() {
@@ -66,6 +109,24 @@ export function createSession(io: Server) {
         return
       }
 
+      const existing = participants.get(participantId)
+      if (existing) {
+        existing.socketId = socket.id
+        const galaxy = GALAXIES.find((g) => g.id === existing.galaxyId)
+        socket.emit('participant:assigned', {
+          galaxyId: existing.galaxyId,
+          galaxy,
+          pairId: existing.pairId,
+          pairColor: existing.pairColor,
+          joinOrder: existing.joinOrder,
+        })
+        socket.emit('session:state', sessionState)
+        if (currentScene) socket.emit('scene:change', currentScene)
+        io.emit('stats:update', { connected: participants.size })
+        return
+      }
+
+      joinCounter++
       const galaxyId = assignGalaxy()
       const participant: Participant = {
         id: participantId,
@@ -73,7 +134,9 @@ export function createSession(io: Server) {
         seatId,
         galaxyId,
         pairId: null,
-        hiddenState: { schrodinger: Math.random() < 0.002 ? 'signal' : 'silence' },
+        pairColor: null,
+        joinOrder: joinCounter,
+        hiddenState: {},
         connectedAt: new Date(),
       }
 
@@ -86,14 +149,30 @@ export function createSession(io: Server) {
         galaxyId,
         galaxy,
         pairId: null,
-        hiddenState: {},
+        pairColor: null,
+        joinOrder: joinCounter,
       })
 
       socket.emit('session:state', sessionState)
       if (currentScene) socket.emit('scene:change', currentScene)
 
+      const unpaired = findUnpairedParticipant(participantId)
+      if (unpaired) {
+        pairTwo(participant, unpaired)
+      }
+
       io.emit('stats:update', { connected: participants.size })
-      console.log(`Participant ${participantId} joined seat ${seatId}, galaxy ${galaxyId}`)
+      console.log(`Participant ${participantId} joined seat ${seatId}, galaxy ${galaxyId}, order ${joinCounter}`)
+    })
+
+    socket.on('galaxy:reroll', (data: { excludeIds: string[] }) => {
+      const exclude = new Set(data.excludeIds || [])
+      const available = GALAXIES.filter((g) => !exclude.has(g.id))
+      if (available.length === 0) return
+      const newGalaxy = available[Math.floor(Math.random() * available.length)]
+      const participant = findParticipantBySocket(socket.id)
+      if (participant) participant.galaxyId = newGalaxy.id
+      socket.emit('galaxy:rerolled', { galaxy: newGalaxy })
     })
 
     socket.on('poll:vote', (data: { sceneId: string; optionId: string }) => {
@@ -109,7 +188,8 @@ export function createSession(io: Server) {
       const pair = participants.get(participant.pairId)
       if (pair) {
         const pairSocket = io.sockets.sockets.get(pair.socketId)
-        pairSocket?.emit('entanglement:tap')
+        pairSocket?.emit('entanglement:tap', { color: participant.pairColor })
+        socket.emit('entanglement:tap-self', { color: participant.pairColor })
       }
     })
 
@@ -127,6 +207,22 @@ export function createSession(io: Server) {
     socket.on('disconnect', () => {
       const participant = findParticipantBySocket(socket.id)
       if (participant) {
+        if (participant.pairId) {
+          const pair = participants.get(participant.pairId)
+          if (pair) {
+            pair.pairId = null
+            pair.pairColor = null
+            const pairSocket = io.sockets.sockets.get(pair.socketId)
+            pairSocket?.emit('entanglement:unpaired')
+            const newMatch = findUnpairedParticipant(pair.id)
+            if (newMatch) {
+              pairTwo(pair, newMatch)
+            }
+          }
+        }
+        participants.delete(participant.id)
+        if (participant.seatId) seatToParticipant.delete(participant.seatId)
+        io.emit('stats:update', { connected: participants.size })
         console.log(`Client disconnected: ${participant.id}`)
       }
     })
@@ -139,10 +235,26 @@ export function createSession(io: Server) {
     return undefined
   }
 
-  // Admin functions
   function launchScene(scene: ActiveScene) {
     currentScene = { ...scene, state: 'running' }
     pollVotes = new Map()
+
+    if (scene.type === 'entanglement_pair') {
+      assignPairs()
+      for (const p of participants.values()) {
+        if (p.pairId && p.pairColor) {
+          const s = io.sockets.sockets.get(p.socketId)
+          s?.emit('entanglement:paired', { pairColor: p.pairColor })
+        }
+      }
+    }
+
+    io.emit('scene:change', currentScene)
+  }
+
+  function openSchrodinger() {
+    if (currentScene?.type !== 'schrodinger') return
+    currentScene = { ...currentScene, params: { ...currentScene.params, opened: true }, state: 'running' }
     io.emit('scene:change', currentScene)
   }
 
@@ -168,6 +280,7 @@ export function createSession(io: Server) {
     launchScene,
     stopScene,
     blackout,
+    openSchrodinger,
     setSessionState,
     assignPairs,
     getClientCount: () => participants.size,

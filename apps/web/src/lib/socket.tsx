@@ -4,7 +4,7 @@ import { createContext, useContext, useEffect, useRef, type ReactNode } from 're
 import { io, Socket } from 'socket.io-client'
 import { useStore } from './store'
 
-const SERVER_URL = process.env.NEXT_PUBLIC_SERVER_URL || 'http://localhost:3001'
+const SERVER_URL = process.env.NEXT_PUBLIC_SERVER_URL || 'http://localhost:3002'
 
 const SocketContext = createContext<Socket | null>(null)
 
@@ -40,7 +40,17 @@ export function SocketProvider({ children }: { children: ReactNode }) {
 
     socket.on('participant:assigned', (data) => {
       if (data.galaxy) store.setGalaxy(data.galaxy)
+      if (data.joinOrder) store.setJoinOrder(data.joinOrder)
+      if (data.pairColor) store.setPairColor(data.pairColor)
       store.setJoined(true)
+    })
+
+    socket.on('entanglement:paired', (data) => {
+      if (data.pairColor) store.setPairColor(data.pairColor)
+    })
+
+    socket.on('entanglement:unpaired', () => {
+      store.setPairColor(null)
     })
 
     socket.on('session:state', (state) => {
